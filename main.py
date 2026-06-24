@@ -1,9 +1,7 @@
 
-# ================================================================
 # Generate Triplet Embeddings + Train Compressors + Benchmark
 # Compares: BERT (128/256/512/768) vs Gemma (2B/2-2B) vs
 #           PCA compression vs Our InfoNCE+MSE neural compressor
-# ================================================================
 
 import os
 import gc
@@ -20,18 +18,18 @@ from transformers import AutoTokenizer, AutoModel
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# ── Device ───────────────────────────────────────────────────────
+# Device
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device : {DEVICE}")
 
-# ── Local paths ──────────────────────────────────────────────────
+# Local paths
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 SAVE_DIR       = os.path.join(BASE_DIR, "contrastive_embs")
 COMPRESSOR_DIR = os.path.join(BASE_DIR, "multi_compressors")
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(COMPRESSOR_DIR, exist_ok=True)
 
-# ── Model Registry ───────────────────────────────────────────────
+# Model Registry
 # Each entry: dim -> {"name": HF model id, "is_decoder": bool}
 # is_decoder=True  → Gemma-style causal LMs (need left-pad, pad=eos)
 # is_decoder=False → BERT-style encoder models
@@ -40,7 +38,7 @@ MODEL_CONFIGS = {
     #256:  {"name": "google/bert_uncased_L-4_H-256_A-4",  "is_decoder": False},
     #512:  {"name": "google/bert_uncased_L-4_H-512_A-8",  "is_decoder": False},
     #768:  {"name": "bert-base-uncased",                  "is_decoder": False},
-    # ── Gemma models ─────────────────────────────────────────────
+    # Gemma models
     # Requires HuggingFace token: huggingface-cli login
     2048: {"name": "google/gemma-2b",                   "is_decoder": True},
     2304: {"name": "google/gemma-2-2b",                 "is_decoder": True},
@@ -53,13 +51,13 @@ GEMMA_DIMS  = [2048, 2304]
 # Compressor target dims (768-dim BERT → these sizes)
 COMPRESS_DIMS = [512, 256, 128]
 
-BATCH_SIZE   = 128
+BATCH_SIZE   = 512
 MAX_LENGTH   = 128
 USE_FP16     = True
 MAX_TRIPLETS = None   # e.g. 50_000 for a quick smoke test
 
 
-# ── Model / Tokenizer Loader ─────────────────────────────────────
+# Model / Tokenizer Loader
 def load_model_tokenizer(dim: int):
     """Load model+tokenizer from MODEL_CONFIGS[dim].
     Handles both BERT-style encoders and Gemma-style decoder LMs."""
@@ -82,13 +80,13 @@ def load_model_tokenizer(dim: int):
     return model, tokenizer
 
 
-# ── Mean Pooling (attention-mask aware) ──────────────────────────
+# Mean Pooling (attention-mask aware)
 def mean_pool(last_hidden_state, attention_mask):
     mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
     return torch.sum(last_hidden_state * mask, 1) / torch.clamp(mask.sum(1), min=1e-9)
 
 
-# ── Sentence Encoder ─────────────────────────────────────────────
+# Sentence Encoder
 @torch.no_grad()
 def encode(sentences: list[str], model, tokenizer, desc="encoding") -> np.ndarray:
     """Encode a list of sentences into mean-pooled, L2-normalised embeddings."""
@@ -106,9 +104,7 @@ def encode(sentences: list[str], model, tokenizer, desc="encoding") -> np.ndarra
     return np.vstack(all_embs)
 
 
-# ================================================================
-# PHASE 1 — Build Triplets & Generate Embeddings
-# ================================================================
+# PHASE 1 - Build Triplets & Generate Embeddings
 
 def build_triplets(dataset) -> list[tuple[str, str, str]]:
     prem2hyp: dict[str, dict[int, list[str]]] = {}
@@ -152,6 +148,12 @@ print("\n[Phase 1] Encoding triplets across all models…")
 metadata = {"max_length": MAX_LENGTH, "pooling": "mean", "total_triplets": len(anchors)}
 
 for dim, cfg in MODEL_CONFIGS.items():
+    npz_path = os.path.join(SAVE_DIR, f"triplet_embeddings_{dim}.npz")
+    if os.path.exists(npz_path):
+        print(f"  Skipping {dim}-dim : {cfg['name']} (embeddings already exist at {npz_path})")
+        metadata[f"model_{dim}"] = cfg["name"]
+        continue
+
     print(f"\n{'='*55}")
     tag = "Gemma" if cfg["is_decoder"] else "BERT"
     print(f"  [{tag}] Encoding {dim}-dim : {cfg['name']}")
@@ -165,7 +167,6 @@ for dim, cfg in MODEL_CONFIGS.items():
     neg_embs    = encode(negatives, model, tokenizer, desc=f"neg-{dim}")
     print(f"  Done in {(time.time()-t0)/60:.1f} min")
 
-    npz_path = os.path.join(SAVE_DIR, f"triplet_embeddings_{dim}.npz")
     np.savez_compressed(npz_path,
                         anchors=anchor_embs, positives=pos_embs, negatives=neg_embs)
     metadata[f"model_{dim}"] = cfg["name"]
@@ -186,14 +187,12 @@ np.savez_compressed(
 with open(os.path.join(SAVE_DIR, "metadata.json"), "w") as f:
     json.dump(metadata, f, indent=2)
 
-print(f"\n✅ Phase 1 complete — embeddings saved to {SAVE_DIR}")
+print(f"\n Phase 1 complete - embeddings saved to {SAVE_DIR}")
 
 
-# ================================================================
-# PHASE 2 — Train Neural Compressors (BERT-768 → 512 / 256 / 128)
-# ================================================================
+# PHASE 2 - Train Neural Compressors (BERT-768 → 512 / 256 / 128)
 
-# ── Config ───────────────────────────────────────────────────────
+# Config
 CFG = {
     "input_dim"    : 768,
     "target_dims"  : COMPRESS_DIMS,
@@ -212,7 +211,7 @@ CFG = {
 }
 
 
-# ── Dataset ──────────────────────────────────────────────────────
+# Dataset
 class TripletEmbDataset(Dataset):
     def __init__(self, npz_path):
         data = np.load(npz_path)
@@ -227,7 +226,7 @@ class TripletEmbDataset(Dataset):
         return self.anchors[idx], self.positives[idx], self.negatives[idx]
 
 
-# ── Autoencoder ──────────────────────────────────────────────────
+# Autoencoder
 class EmbeddingAutoencoder(nn.Module):
     """Neural compressor: in_dim → hid_dim → out_dim (+ decoder for MSE)."""
     def __init__(self, in_dim=768, hid_dim=512, out_dim=128):
@@ -251,7 +250,7 @@ class EmbeddingAutoencoder(nn.Module):
         return F.normalize(self.encoder(x), p=2, dim=-1, eps=1e-6)
 
 
-# ── Hybrid Loss: InfoNCE + MSE ────────────────────────────────────
+# Hybrid Loss: InfoNCE + MSE
 class InfoNCEWithHardNegAndMSE(nn.Module):
     def __init__(self, temperature=0.05, mse_weight=1.0):
         super().__init__()
@@ -281,7 +280,7 @@ class InfoNCEWithHardNegAndMSE(nn.Module):
         return loss_infonce + self.mse_weight * loss_mse, loss_infonce, loss_mse
 
 
-# ── Cosine LR with Warmup ─────────────────────────────────────────
+# Cosine LR with Warmup
 def get_scheduler(optimizer, warmup_steps, total_steps):
     def lr_lambda(step):
         if step < warmup_steps:
@@ -291,7 +290,7 @@ def get_scheduler(optimizer, warmup_steps, total_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-# ── Training Loop ─────────────────────────────────────────────────
+# Training Loop
 def train_compressor(cfg, target_dim, loader):
     print(f"\n{'='*60}")
     print(f"  TRAINING COMPRESSOR : BERT-768 → {target_dim}")
@@ -331,18 +330,16 @@ def train_compressor(cfg, target_dim, loader):
             torch.save(model.state_dict(),
                        os.path.join(cfg["save_dir"], f"compressor_{target_dim}_best.pt"))
 
-    print(f"  ✅ Finished 768 → {target_dim}  (Best Loss: {best_loss:.4f})")
+    print(f"   Finished 768 → {target_dim}  (Best Loss: {best_loss:.4f})")
     return model
 
 
-# ================================================================
-# PHASE 3 — Ultimate Benchmark
+# PHASE 3 - Ultimate Benchmark
 #   Rows: Native-BERT (128/256/512/768), Native-Gemma (2048/2304),
 #         PCA-{512/256/128}, Ours-{512/256/128}
 #   Cols: STS-B, SST-2, QNLI, Recall@10, MRR@10 | Stor, Speed, Enc, VRAM
-# ================================================================
 
-# ── Benchmark helpers (defined at module level for reuse) ─────────
+# Benchmark helpers (defined at module level for reuse)
 from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
@@ -410,16 +407,14 @@ def search_speed_and_mem(d_cpu, q_cpu):
     return ms, mem
 
 
-# ── All benchmark native dims (BERT + Gemma) ──────────────────────
+# All benchmark native dims (BERT + Gemma)
 ALL_NATIVE_DIMS = BERT_DIMS + GEMMA_DIMS   # [128, 256, 512, 768, 2048, 2304]
 
 
-# ================================================================
 # Entry point
-# ================================================================
 if __name__ == "__main__":
 
-    # ── Phase 2: Train compressors ────────────────────────────────
+    # Phase 2: Train compressors
     print("\n[Phase 2] Training neural compressors on BERT-768 triplets…")
     if not os.path.exists(CFG["emb_path"]):
         print(f"  ⚠️  Skipping Phase 2: {CFG['emb_path']} not found. (Did you run Phase 1 with BERT-768 enabled?)")
@@ -435,15 +430,19 @@ if __name__ == "__main__":
         )
 
         for target_dim in CFG["target_dims"]:
+            pt_path = os.path.join(CFG["save_dir"], f"compressor_{target_dim}_best.pt")
+            if os.path.exists(pt_path):
+                print(f"  Compressor 768 → {target_dim} already exists at {pt_path}. Skipping training.")
+                continue
             train_compressor(CFG, target_dim, loader)
 
         json.dump(CFG, open(os.path.join(CFG["save_dir"], "config.json"), "w"), indent=2)
-        print(f"\n✅ Phase 2 complete — compressors saved to {COMPRESSOR_DIR}")
+        print(f"\nPhase 2 complete - compressors saved to {COMPRESSOR_DIR}")
 
 
-    # ── Phase 3: Benchmark ────────────────────────────────────────
+    # Phase 3: Benchmark
     print("\n[Phase 3] Loading all native models for benchmark…")
-    print("  NOTE: Gemma models are gated — run `huggingface-cli login` first.\n")
+    print("  NOTE: Gemma models are gated - run `huggingface-cli login` first.\n")
 
     # Load native models (BERT + Gemma)
     for dim in ALL_NATIVE_DIMS:
@@ -480,10 +479,10 @@ if __name__ == "__main__":
     # Helper: only evaluate dims that were successfully loaded
     avail_native = [d for d in ALL_NATIVE_DIMS if d in _bench_native_models]
 
-    # ── 1. STS-B ─────────────────────────────────────────────────
+    # 1. STS-B
     print("\n[3a] Evaluating STS-B…")
     if avail_native:
-        ds      = load_dataset("glue", "stsb", split="validation")
+        ds      = load_dataset("nyu-mll/glue", "stsb", split="validation")
         sents1  = ds["sentence1"]; sents2 = ds["sentence2"]
         sts_scores = np.array(ds["label"])
 
@@ -513,11 +512,11 @@ if __name__ == "__main__":
                         bench_compress(e1_nat[768], d),
                         bench_compress(e2_nat[768], d))
 
-    # ── 2. SST-2 ─────────────────────────────────────────────────
+    # 2. SST-2
     print("[3b] Evaluating SST-2…")
     if avail_native:
-        tr_ds   = load_dataset("glue", "sst2", split="train")
-        va_ds   = load_dataset("glue", "sst2", split="validation")
+        tr_ds   = load_dataset("nyu-mll/glue", "sst2", split="train")
+        va_ds   = load_dataset("nyu-mll/glue", "sst2", split="validation")
         tr_sent, tr_lbl = tr_ds["sentence"], tr_ds["label"]
         va_sent, va_lbl = va_ds["sentence"], va_ds["label"]
 
@@ -545,11 +544,11 @@ if __name__ == "__main__":
                         bench_compress(tr_nat[768], d),
                         bench_compress(va_nat[768], d))
 
-    # ── 3. QNLI ──────────────────────────────────────────────────
+    # 3. QNLI
     print("[3c] Evaluating QNLI…")
     if avail_native:
-        tr_q_ds = load_dataset("glue", "qnli", split="train")
-        va_q_ds = load_dataset("glue", "qnli", split="validation")
+        tr_q_ds = load_dataset("nyu-mll/glue", "qnli", split="train")
+        va_q_ds = load_dataset("nyu-mll/glue", "qnli", split="validation")
         tr_q, tr_s, tr_ql = tr_q_ds["question"], tr_q_ds["sentence"], tr_q_ds["label"]
         va_q, va_s, va_ql = va_q_ds["question"], va_q_ds["sentence"], va_q_ds["label"]
 
@@ -583,10 +582,10 @@ if __name__ == "__main__":
                         bench_compress(trq_nat[768], d), bench_compress(trs_nat[768], d),
                         bench_compress(vaq_nat[768], d), bench_compress(vas_nat[768], d))
 
-    # ── 4. Quora Retrieval (Recall@10 / MRR@10) ──────────────────
+    # 4. Quora Retrieval (Recall@10 / MRR@10)
     print("[3d] Evaluating Quora Retrieval…")
     if avail_native:
-        qqp_ds    = load_dataset("glue", "qqp", split="validation")
+        qqp_ds    = load_dataset("nyu-mll/glue", "qqp", split="validation")
         pos_pairs = [r for r in qqp_ds if r["label"] == 1][:5000]
         qqp_q     = [r["question1"] for r in pos_pairs]
         qqp_d     = [r["question2"] for r in pos_pairs]
@@ -623,7 +622,7 @@ if __name__ == "__main__":
                                                  bench_compress(ed_nat[768], d))
                     results[f"ours_{d}"]["r10"], results[f"ours_{d}"]["mrr"] = r10, mrr
 
-    # ── 5. Efficiency (Storage / Search Speed / VRAM) ────────────
+    # 5. Efficiency (Storage / Search Speed / VRAM)
     print("[3e] Evaluating Efficiency…")
     N_DOCS, N_BENCH_Q = 100_000, 1_000
 
@@ -662,7 +661,7 @@ if __name__ == "__main__":
                 results[f"ours_{d}"]["s_ms"] = s
                 results[f"ours_{d}"]["mem"]  = mem
 
-    # ── Print Results Table ───────────────────────────────────────
+    # Print Results Table
     W = 125
     print("\n" + "=" * W)
     print(f"  BENCHMARK RESULTS")
@@ -713,4 +712,4 @@ if __name__ == "__main__":
     # Save results as JSON
     out_path = os.path.join(BASE_DIR, "benchmark_results.json")
     json.dump(dict(results), open(out_path, "w"), indent=2)
-    print(f"\n✅ Full results saved → {out_path}")
+    print(f"\n Full results saved → {out_path}")
